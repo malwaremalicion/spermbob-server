@@ -1,7 +1,7 @@
 // server.js
 const WebSocket = require('ws');
-const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server running on " + PORT));
 const server = require('http').createServer();
 const WebSocket = require('ws');
 const wss = new WebSocket.Server({ server });
@@ -246,6 +246,7 @@ wss.on('connection', ws => {
 });
 
 process.on('SIGINT', ()=> { console.log('shutting down'); wss.close(()=>process.exit(0)); });
+
 
 
 
