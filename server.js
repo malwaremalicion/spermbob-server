@@ -1,146 +1,126 @@
-// server.js
-import { WebSocketServer } from 'ws';
-import { randomUUID } from 'crypto';
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ port: 8080 });
 
-const PORT = process.env.PORT || 443;
-const STEAL_TIMEOUT = 15000; // 15 seconds
+console.log("WebSocket server running on ws://localhost:8080");
 
-const rooms = {};
-
-const wss = new WebSocketServer({ port: PORT });
-console.log(`WebSocket server running on port ${PORT}`);
+const rooms = {}; // roomCode => { players: {id: {username, collection, money, ws}} }
+const STEAL_TIMEOUT = 15000;
 
 wss.on('connection', ws => {
-  let playerId = randomUUID();
-  let roomCode = null;
-  let activeSteals = {}; // key: victimId_slot -> { thiefId, timeout }
+  ws.id = Math.random().toString(36).substr(2,9);
+  ws.room = null;
+  ws.activeSteals = {}; // key victimId_slot -> {thiefId, timeout}
 
   ws.on('message', msg => {
-    try {
-      const data = JSON.parse(msg.toString());
+    let data;
+    try { data = JSON.parse(msg); } catch(e){ return; }
 
-      if (data.type === 'joinRoom') {
-        const rc = data.roomCode;
-        const username = data.username || 'player';
+    // JOIN ROOM
+    if(data.type === 'joinRoom'){
+      const code = data.roomCode;
+      ws.room = code;
+      if(!rooms[code]) rooms[code] = { players:{} };
+      rooms[code].players[ws.id] = { username: data.username, collection: Array(8).fill(null), money: data.money ?? 30, ws };
+      broadcastRoom(code);
+    }
 
-        if (!rooms[rc]) rooms[rc] = { players: {} };
-        roomCode = rc;
-        rooms[rc].players[playerId] = {
-          username,
-          money: data.money ?? 30,
-          collection: data.collection ?? Array(8).fill(null),
-          ws
-        };
-        broadcastRoom(rc);
+    if(!ws.room || !rooms[ws.room]) return;
+
+    const room = rooms[ws.room];
+
+    // UPDATE COLLECTION/MONEY
+    if(data.type === 'update'){
+      if(data.collection) room.players[ws.id].collection = data.collection;
+      if(data.money !== undefined) room.players[ws.id].money = data.money;
+      broadcastRoom(ws.room);
+    }
+
+    // BUY
+    if(data.type==='buy' && data.slot !== undefined && data.item){
+      room.players[ws.id].collection[data.slot] = data.item;
+      room.players[ws.id].money -= data.item.cost ?? 0;
+      broadcastRoom(ws.room);
+    }
+
+    // SELL
+    if(data.type==='sell' && data.slot !== undefined){
+      const item = room.players[ws.id].collection[data.slot];
+      if(item){
+        room.players[ws.id].money += Math.floor((item.mps||0)*5); // refund formula
+        room.players[ws.id].collection[data.slot] = null;
+        broadcastRoom(ws.room);
       }
+    }
 
-      if (!roomCode) return;
-      const player = rooms[roomCode].players[playerId];
+    // START STEAL
+    if(data.type==='stealStart' && data.victimId !== undefined && data.slot !== undefined){
+      const victim = room.players[data.victimId];
+      if(!victim) return;
+      const key = `${data.victimId}_${data.slot}`;
+      if(ws.activeSteals[key]) return;
 
-      // Update money/collection
-      if (data.type === 'update') {
-        if (data.money !== undefined) player.money = data.money;
-        if (data.collection) player.collection = data.collection;
-        broadcastRoom(roomCode);
-      }
+      // notify all
+      broadcastRoom(ws.room, { type:'stealStart', thiefId: ws.id, victimId:data.victimId, slot:data.slot });
 
-      // Buy an item
-      if (data.type === 'buy') {
-        broadcastRoom(roomCode, { type: 'buy', itemId: data.item });
-      }
-
-      // Start a steal
-      if (data.type === 'stealStart') {
-        const victimId = data.victimId;
-        const slot = data.slot;
-        const victim = rooms[roomCode].players[victimId];
-        if (!victim) return;
-
-        const key = `${victimId}_${slot}`;
-        if (activeSteals[key]) return; // already stealing
-
-        broadcastRoom(roomCode, { type: 'stealStart', thiefId: playerId, victimId, slot });
-
-        // start steal timeout
-        const timeout = setTimeout(() => {
-          const victimPlayer = rooms[roomCode]?.players[victimId];
-          if (!victimPlayer) return;
-
-          // transfer item if present
-          const item = victimPlayer.collection[slot];
-          if (item) {
-            const thiefPlayer = rooms[roomCode].players[playerId];
+      // steal timeout
+      const timeout = setTimeout(()=>{
+        const victimPlayer = room.players[data.victimId];
+        const thiefPlayer = room.players[ws.id];
+        if(victimPlayer && thiefPlayer){
+          const item = victimPlayer.collection[data.slot];
+          if(item){
             const freeIndex = thiefPlayer.collection.findIndex(c => !c);
-            if (freeIndex !== -1) {
+            if(freeIndex!==-1){
               thiefPlayer.collection[freeIndex] = item;
-              victimPlayer.collection[slot] = null;
+              victimPlayer.collection[data.slot] = null;
             }
           }
-
-          broadcastRoom(roomCode, { type: 'stealSuccess', thiefId: playerId, victimId, slot });
-          delete activeSteals[key];
-          broadcastRoom(roomCode);
-        }, STEAL_TIMEOUT);
-
-        activeSteals[key] = { thiefId: playerId, timeout };
-      }
-
-      // Victim blocked steal
-      if (data.type === 'stealBlocked') {
-        const key = `${data.victimId}_${data.slot}`;
-        const steal = activeSteals[key];
-        if (steal) {
-          clearTimeout(steal.timeout);
-          delete activeSteals[key];
-          broadcastRoom(roomCode, { type: 'stealBlocked', thiefId: steal.thiefId, victimId: data.victimId, slot: data.slot });
+          broadcastRoom(ws.room, { type:'stealSuccess', thiefId: ws.id, victimId:data.victimId, slot:data.slot });
+          broadcastRoom(ws.room);
         }
-      }
+        delete ws.activeSteals[key];
+      }, STEAL_TIMEOUT);
 
-    } catch (e) {
-      console.error('Error handling message', e);
+      ws.activeSteals[key] = { thiefId: ws.id, timeout };
+    }
+
+    // BLOCK STEAL
+    if(data.type==='stealBlocked' && data.victimId!==undefined && data.slot!==undefined){
+      const key = `${data.victimId}_${data.slot}`;
+      const steal = ws.activeSteals[key];
+      if(steal){
+        clearTimeout(steal.timeout);
+        delete ws.activeSteals[key];
+        broadcastRoom(ws.room, { type:'stealBlocked', thiefId: steal.thiefId, victimId:data.victimId, slot:data.slot });
+      }
     }
   });
 
-  ws.on('close', () => {
-    if (roomCode && rooms[roomCode]?.players[playerId]) {
-      delete rooms[roomCode].players[playerId];
-
-      // clear any active steals involving this player
-      for (const key in activeSteals) {
-        if (key.startsWith(playerId + '_') || key.includes(`_${playerId}`)) {
-          clearTimeout(activeSteals[key].timeout);
-          delete activeSteals[key];
-        }
-      }
-
-      if (Object.keys(rooms[roomCode].players).length === 0) delete rooms[roomCode];
-      else broadcastRoom(roomCode);
+  ws.on('close', ()=>{
+    if(ws.room && rooms[ws.room] && rooms[ws.room].players[ws.id]){
+      delete rooms[ws.room].players[ws.id];
+      if(Object.keys(rooms[ws.room].players).length===0) delete rooms[ws.room];
+      else broadcastRoom(ws.room);
     }
   });
-
-  // Send initial ID
-  ws.send(JSON.stringify({ type: 'id', id: playerId }));
 });
 
-function broadcastRoom(rc, extra = null) {
-  if (!rooms[rc]) return;
-  const roomData = {
-    type: 'roomUpdate',
-    players: {},
-    ...extra
-  };
-  for (const pid in rooms[rc].players) {
-    const p = rooms[rc].players[pid];
-    roomData.players[pid] = {
+function broadcastRoom(code, extra=null){
+  const room = rooms[code];
+  if(!room) return;
+  const payload = { type:'roomUpdate', players:{} };
+  for(const id in room.players){
+    const p = room.players[id];
+    payload.players[id] = {
       username: p.username,
-      money: p.money,
-      collection: p.collection
+      collection: p.collection,
+      money: p.money
     };
-    roomData.you = pid; // each client will pick its own ID on receipt
   }
+  if(extra) Object.assign(payload, extra);
 
-  for (const pid in rooms[rc].players) {
-    const p = rooms[rc].players[pid];
-    try { p.ws.send(JSON.stringify(roomData)); } catch (e) {}
+  for(const id in room.players){
+    const p = room.players[id];
+    try { p.ws.send(JSON.stringify(payload)); } catch(e){}
   }
 }
