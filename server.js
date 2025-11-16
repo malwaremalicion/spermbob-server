@@ -182,41 +182,53 @@ wss.on('connection', ws => {
       return;
     }
 
-    // buy (authoritative)
-    if(data.type === 'buy' && data.slot !== undefined && data.item){
-      const buyer = room.players[ws.id];
-      if(!buyer) return;
-      const slot = Number(data.slot);
-      const item = data.item;
-      const cost = Number(item.cost) || 0;
+   // BUY (authoritative, uses server-side walker info)
+if (data.type === 'buy' && data.slot !== undefined && data.itemId) {
+    const buyer = room.players[ws.id];
+    if (!buyer) return;
 
-      // validations
-      if(slot < 0 || slot >= buyer.collection.length) return;
-      if(buyer.collection[slot] !== null) return; // occupied
-      if(buyer.money === undefined) buyer.money = 0;
-      if(buyer.money < cost) {
-        // insufficient funds -> reject (could send an error event)
-        try{ ws.send(JSON.stringify({ type:'error', message:'insufficient_funds' })); }catch(e){}
+    const slot = Number(data.slot);
+    if (slot < 0 || slot >= buyer.collection.length) return;
+    if (buyer.collection[slot] !== null) return; // slot occupied
+
+    const walker = room.walkers[data.itemId];
+    if (!walker) return; // walker doesn't exist or already bought
+
+    // Verify cost
+    const cost = Number(walker.cost) || 0;
+    if (buyer.money < cost) {
+        try {
+            ws.send(JSON.stringify({ type:'error', message:'insufficient_funds' }));
+        } catch (e) {}
         return;
-      }
-
-      // apply buy
-      buyer.collection[slot] = {
-        type: item.type,
-        rarity: item.rarity,
-        mps: Number(item.mps) || 0,
-        cost: cost
-      };
-      buyer.money -= cost;
-
-      // remove walker from room if itemId provided
-      if(data.itemId && room.walkers[data.itemId]) delete room.walkers[data.itemId];
-
-      // notify others a buy happened, then broadcast full room state
-      broadcastRoom(ws.room, { type:'buy', buyerId: ws.id, slot, itemId: data.itemId });
-      broadcastRoom(ws.room);
-      return;
     }
+
+    // Apply purchase
+    buyer.money -= cost;
+
+    // Add walker to collection (real data stored on server)
+    buyer.collection[slot] = {
+        type: walker.type,
+        rarity: walker.rarity,
+        mps: walker.mps,
+        cost: walker.cost
+    };
+
+    // Remove walker from spawn list
+    delete room.walkers[data.itemId];
+
+    // Announce to players
+    broadcastRoom(ws.room, {
+        type: 'buy',
+        buyerId: ws.id,
+        slot,
+        itemId: data.itemId
+    });
+
+    // Full update
+    broadcastRoom(ws.room);
+    return;
+}
 
     // sell
     if(data.type === 'sell' && data.slot !== undefined){
@@ -321,3 +333,4 @@ process.on('SIGINT', ()=> {
   console.log('Shutting down...');
   wss.close(()=> process.exit(0));
 });
+
