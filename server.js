@@ -1,8 +1,14 @@
 // server.js
 const http = require('http');
-const WebSocket = require('ws'); // only declared once
+const WebSocket = require('ws');
 
+// Railway provides the port in process.env.PORT
 const PORT = process.env.PORT || 8080;
+
+const wss = new WebSocket.Server({ port: PORT });
+
+console.log(`WebSocket server running on port ${PORT}`);
+
 
 const server = http.createServer();
 server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
@@ -138,6 +144,7 @@ function broadcastRoom(code, extra=null){
     try { p.ws.send(JSON.stringify(payload)); } catch(e){}
   }
 }
+
 
 
 
