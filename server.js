@@ -1,7 +1,15 @@
 // server.js
 const WebSocket = require('ws');
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const PORT = process.env.PORT || 8080;
+const server = require('http').createServer();
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ server });
+
+server.listen(PORT, () => {
+  console.log("WebSocket server running on port " + PORT);
+});
+
 console.log(`WS server running on port ${PORT}`);
 
 const STEAL_TIMEOUT = 15000;
@@ -238,6 +246,7 @@ wss.on('connection', ws => {
 });
 
 process.on('SIGINT', ()=> { console.log('shutting down'); wss.close(()=>process.exit(0)); });
+
 
 
 
