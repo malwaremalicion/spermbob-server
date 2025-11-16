@@ -6,13 +6,19 @@ const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
 
 console.log(`WebSocket server running on 0.0.0.0:${PORT}`);
 
-const rooms = {}; // roomCode => { players: {id: {username, collection, money, ws}} }
+const rooms = {}; // roomCode => { players: {id: {username, collection, money, ws}}, walkers: [] }
 const STEAL_TIMEOUT = 15000;
+
+// Example walker pool
+const WALKER_POOL = [
+  { id: 'w1', type: 'bellbob', cost: 10, mps: 1, rarity: 'common' },
+  { id: 'w2', type: 'spermbob', cost: 20, mps: 2, rarity: 'rare' }
+];
 
 wss.on('connection', ws => {
   ws.id = Math.random().toString(36).substr(2, 9);
   ws.room = null;
-  ws.activeSteals = {}; // key victimId_slot -> {thiefId, timeout}
+  ws.activeSteals = {};
 
   ws.on('message', msg => {
     let data;
@@ -22,13 +28,21 @@ wss.on('connection', ws => {
     if (data.type === 'joinRoom') {
       const code = data.roomCode || 'lobby';
       ws.room = code;
-      if (!rooms[code]) rooms[code] = { players: {} };
+      if (!rooms[code]) rooms[code] = { players: {}, walkers: [] };
+
+      // Add player
       rooms[code].players[ws.id] = {
         username: data.username || ('player' + Math.floor(Math.random() * 9999)),
         collection: Array(8).fill(null),
         money: data.money ?? 30,
         ws
       };
+
+      // spawn walkers for this room only once
+      if (rooms[code].walkers.length === 0) {
+        rooms[code].walkers = WALKER_POOL.map(w => ({ ...w }));
+      }
+
       broadcastRoom(code);
       return;
     }
@@ -36,30 +50,42 @@ wss.on('connection', ws => {
     if (!ws.room || !rooms[ws.room]) return;
     const room = rooms[ws.room];
 
-    // UPDATE COLLECTION/MONEY
-    if (data.type === 'update') {
-      if (data.collection) room.players[ws.id].collection = data.collection;
-      if (data.money !== undefined) room.players[ws.id].money = data.money;
-      broadcastRoom(ws.room);
-      return;
-    }
-
     // BUY
-    if (data.type === 'buy' && data.slot !== undefined && data.item) {
-      room.players[ws.id].collection[data.slot] = data.item;
-      room.players[ws.id].money -= data.item.cost ?? 0;
+    if (data.type === 'buy' && data.slot !== undefined && data.itemId) {
+      const freeSlot = data.slot;
+      const player = room.players[ws.id];
+      const walker = room.walkers.find(w => w.id === data.itemId);
+      if (!walker || !player || player.money < walker.cost) return;
+
+      player.collection[freeSlot] = { ...walker }; // assign full walker info
+      player.money -= walker.cost;
+
+      // remove walker from room
+      room.walkers = room.walkers.filter(w => w.id !== data.itemId);
+
       broadcastRoom(ws.room);
       return;
     }
 
     // SELL
     if (data.type === 'sell' && data.slot !== undefined) {
-      const item = room.players[ws.id].collection[data.slot];
+      const player = room.players[ws.id];
+      const item = player.collection[data.slot];
       if (item) {
-        room.players[ws.id].money += Math.floor((item.mps || 0) * 5);
-        room.players[ws.id].collection[data.slot] = null;
+        player.money += Math.floor((item.mps || 0) * 5);
+        player.collection[data.slot] = null;
         broadcastRoom(ws.room);
       }
+      return;
+    }
+
+    // UPDATE COLLECTION/MONEY
+    if (data.type === 'update') {
+      const player = room.players[ws.id];
+      if (!player) return;
+      if (data.collection) player.collection = data.collection;
+      if (data.money !== undefined) player.money = data.money;
+      broadcastRoom(ws.room);
       return;
     }
 
@@ -119,7 +145,7 @@ wss.on('connection', ws => {
 function broadcastRoom(code, extra = null) {
   const room = rooms[code];
   if (!room) return;
-  const payload = { type: 'roomUpdate', players: {} };
+  const payload = { type: 'roomUpdate', players: {}, walkers: room.walkers };
   for (const id in room.players) {
     const p = room.players[id];
     payload.players[id] = {
