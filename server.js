@@ -1,29 +1,49 @@
 // server.js
-// Node.js WebSocket server for "Steal A Spermbob"
-// - Walkers are server-generated (spawned per-room)
-// - Walkers are normal items and placed in player's collection when bought
-// - Server ticks money per-player using collection MPS (money per second)
-// - Steal/sell/buy handled server-side (authoritative)
-// - No anti-cheat (per your request)
-
 const WebSocket = require('ws');
-
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 const wss = new WebSocket.Server({ port: PORT });
+console.log(`WS server running on port ${PORT}`);
 
-console.log(`WebSocket server running on ws://localhost:${PORT} (or your host wss URL)`);
+const STEAL_TIMEOUT = 15000;
+const WALKER_SPAWN_MS = 2500;
+const WALKER_LIFETIME_MS = 30000;
+const MONEY_TICK_MS = 1000;
 
-// Config
-const STEAL_TIMEOUT = 15000;        // ms before steal completes
-const WALKER_SPAWN_MS = 2500;       // per-room walker spawn interval
-const WALKER_LIFETIME_MS = 30000;   // how long a walker stays alive if not bought
-const MONEY_TICK_MS = 1000;         // server money tick frequency
-
-// Data: rooms[roomCode] = { players: {id: {username,collection,money,ws}}, walkers: {}, timers: {spawnTimer, moneyTimer} }
 const rooms = {};
 
-// Helpers
-function makeId(len = 8){ return Math.random().toString(36).slice(2,2+len); }
+function makeId(len = 8){ return Math.random().toString(36).slice(2, 2+len); }
+
+function ensureRoom(roomCode){
+  if(!rooms[roomCode]) rooms[roomCode] = { players:{}, walkers:{}, timersStarted:false };
+  const room = rooms[roomCode];
+  if(room.timersStarted) return room;
+  // spawn walkers
+  room.spawnTimer = setInterval(()=> spawnWalkerInRoom(roomCode), WALKER_SPAWN_MS);
+  // cleanup expired walkers
+  room.cleanupTimer = setInterval(()=> {
+    const now = Date.now();
+    let removed = false;
+    for(const id in room.walkers){
+      if(room.walkers[id].expiresAt <= now){ delete room.walkers[id]; removed = true; }
+    }
+    if(removed) broadcastRoom(roomCode);
+  }, 3000);
+  // money tick authoritative server-side
+  room.moneyTimer = setInterval(()=> {
+    for(const id in room.players){
+      const pl = room.players[id];
+      if(!pl) continue;
+      let inc = 0;
+      for(const s of pl.collection){
+        if(s && s.mps) inc += Number(s.mps);
+      }
+      if(inc>0) pl.money = (pl.money || 0) + inc;
+    }
+    broadcastRoom(roomCode);
+  }, MONEY_TICK_MS);
+  room.timersStarted = true;
+  return room;
+}
 
 function spawnWalkerInRoom(roomCode){
   const room = rooms[roomCode];
@@ -47,197 +67,102 @@ function spawnWalkerInRoom(roomCode){
     expiresAt: Date.now() + WALKER_LIFETIME_MS
   };
   room.walkers[walker.id] = walker;
-  // broadcast the spawn immediately (roomUpdate will include walkers)
   broadcastRoom(roomCode, { type:'walkerSpawn', walker });
-  return walker;
 }
 
 function broadcastRoom(roomCode, extra = null){
   const room = rooms[roomCode];
   if(!room) return;
-  const base = { type:'roomUpdate', players:{}, walkers: [] };
-
-  // players: include username, collection, money
+  const base = { type:'roomUpdate', players:{}, walkers: Object.values(room.walkers) };
   for(const id in room.players){
     const p = room.players[id];
-    base.players[id] = {
-      username: p.username,
-      collection: p.collection,
-      money: p.money
-    };
+    base.players[id] = { username: p.username, collection: p.collection, money: p.money };
   }
-
-  // walkers list
-  base.walkers = Object.values(room.walkers || {});
-
-  // send personalized payload to each client with 'you' property
   for(const id in room.players){
     const p = room.players[id];
     const payload = Object.assign({}, base);
     if(extra) Object.assign(payload, extra);
     payload.you = id;
-    try { p.ws.send(JSON.stringify(payload)); } catch(e){ /* ignore send errors */ }
+    try{ p.ws.send(JSON.stringify(payload)); } catch(e){}
   }
 }
 
-// Remove expired walkers periodically for each room
-function cleanupExpiredWalkersInRoom(roomCode){
-  const room = rooms[roomCode];
-  if(!room) return;
-  const now = Date.now();
-  let removed = false;
-  for(const id in room.walkers){
-    if(room.walkers[id].expiresAt <= now){
-      delete room.walkers[id];
-      removed = true;
-    }
-  }
-  if(removed) broadcastRoom(roomCode);
-}
-
-// Ensure room timers exist when room first created
-function ensureRoomTimers(roomCode){
-  const room = rooms[roomCode];
-  if(!room) return;
-  if(room.timersStarted) return;
-  // spawn walkers
-  room.spawnTimer = setInterval(()=> spawnWalkerInRoom(roomCode), WALKER_SPAWN_MS);
-  // cleanup expired walkers (and broadcast if needed)
-  room.cleanupTimer = setInterval(()=> cleanupExpiredWalkersInRoom(roomCode), 3000);
-  // money tick: add money from collection MPS
-  room.moneyTimer = setInterval(()=> {
-    for(const id in room.players){
-      const pl = room.players[id];
-      if(!pl) continue;
-      let inc = 0;
-      for(const s of pl.collection){
-        if(s && s.mps) inc += Number(s.mps);
-      }
-      if(inc > 0){
-        pl.money = (pl.money || 0) + inc;
-      }
-    }
-    broadcastRoom(roomCode);
-  }, MONEY_TICK_MS);
-  room.timersStarted = true;
-}
-
-// Cleanup room timers when empty
-function maybeStopRoomTimers(roomCode){
-  const room = rooms[roomCode];
-  if(!room) return;
-  if(Object.keys(room.players).length === 0){
-    if(room.spawnTimer) { clearInterval(room.spawnTimer); room.spawnTimer = null; }
-    if(room.cleanupTimer) { clearInterval(room.cleanupTimer); room.cleanupTimer = null; }
-    if(room.moneyTimer) { clearInterval(room.moneyTimer); room.moneyTimer = null; }
-    room.timersStarted = false;
-  }
-}
-
-/* WebSocket connection */
 wss.on('connection', ws => {
   ws.id = makeId(9);
   ws.room = null;
-  ws.activeSteals = {}; // key victim_slot -> { thiefId, timeout }
+  ws.activeSteals = {};
 
   ws.on('message', raw => {
     let data;
-    try { data = JSON.parse(raw); } catch(e){ return; }
+    try{ data = JSON.parse(raw); }catch(e){ return; }
 
-    // joinRoom
+    // join
     if(data.type === 'joinRoom'){
       const code = String(data.roomCode || 'lobby');
       ws.room = code;
-      if(!rooms[code]) {
-        rooms[code] = { players: {}, walkers: {}, timersStarted:false };
-      }
+      ensureRoom(code);
       const room = rooms[code];
-      // add player record
       room.players[ws.id] = {
         username: String(data.username || 'player'),
         collection: Array(8).fill(null),
         money: Number(data.money ?? 30),
         ws
       };
-      // start timers for room (walker spawn, money tick)
-      ensureRoomTimers(code);
-      // broadcast updated room
       broadcastRoom(code);
       return;
     }
 
-    // ignore messages if not in a room
     if(!ws.room || !rooms[ws.room]) return;
     const room = rooms[ws.room];
 
-    // update (client -> server). NOTE: server is authoritative for money.
+    // update (client may send collection request to save locally; server accepts collection but remains authoritative for money)
     if(data.type === 'update'){
-      if(data.collection && Array.isArray(data.collection)){
-        // adopt client's collection as-is (user requested to keep this behavior)
-        room.players[ws.id].collection = data.collection;
-      }
-      // Ignore client-sent money to avoid clients directly setting their money.
-      // (You asked for no anti-cheat, but we're still making server authoritative on money ticks and buys)
+      if(Array.isArray(data.collection)) room.players[ws.id].collection = data.collection;
+      // do not accept client's money value to prevent trivial cheating; server will keep its money from ticks/buys/sells
       broadcastRoom(ws.room);
       return;
     }
 
-   // BUY (authoritative, uses server-side walker info)
-if (data.type === 'buy' && data.slot !== undefined && data.itemId) {
-    const buyer = room.players[ws.id];
-    if (!buyer) return;
-
-    const slot = Number(data.slot);
-    if (slot < 0 || slot >= buyer.collection.length) return;
-    if (buyer.collection[slot] !== null) return; // slot occupied
-
-    const walker = room.walkers[data.itemId];
-    if (!walker) return; // walker doesn't exist or already bought
-
-    // Verify cost
-    const cost = Number(walker.cost) || 0;
-    if (buyer.money < cost) {
-        try {
-            ws.send(JSON.stringify({ type:'error', message:'insufficient_funds' }));
-        } catch (e) {}
+    // BUY: server must look up walker in room.walkers by itemId and move it to buyer.collection
+    if(data.type === 'buy' && data.slot !== undefined && data.itemId){
+      const buyer = room.players[ws.id];
+      if(!buyer) return;
+      const slot = Number(data.slot);
+      if(slot < 0 || slot >= buyer.collection.length) return;
+      if(buyer.collection[slot] !== null) return;
+      const walker = room.walkers[data.itemId];
+      if(!walker) {
+        // walker disappeared or already bought
+        try{ ws.send(JSON.stringify({ type:'error', message:'walker_missing' })); }catch(e){}
         return;
-    }
+      }
+      const cost = Number(walker.cost) || 0;
+      if(buyer.money < cost){ try{ ws.send(JSON.stringify({ type:'error', message:'insufficient_funds' })); }catch(e){}; return; }
 
-    // Apply purchase
-    buyer.money -= cost;
-
-    // Add walker to collection (real data stored on server)
-    buyer.collection[slot] = {
+      // apply purchase
+      buyer.money -= cost;
+      buyer.collection[slot] = {
         type: walker.type,
         rarity: walker.rarity,
         mps: walker.mps,
         cost: walker.cost
-    };
+      };
+      // remove walker from room
+      delete room.walkers[data.itemId];
 
-    // Remove walker from spawn list
-    delete room.walkers[data.itemId];
+      // broadcast buy/event + full state
+      broadcastRoom(ws.room, { type:'buy', buyerId: ws.id, slot, itemId: data.itemId });
+      broadcastRoom(ws.room);
+      return;
+    }
 
-    // Announce to players
-    broadcastRoom(ws.room, {
-        type: 'buy',
-        buyerId: ws.id,
-        slot,
-        itemId: data.itemId
-    });
-
-    // Full update
-    broadcastRoom(ws.room);
-    return;
-}
-
-    // sell
+    // SELL
     if(data.type === 'sell' && data.slot !== undefined){
       const pl = room.players[ws.id];
       if(!pl) return;
       const slot = Number(data.slot);
       const item = pl.collection[slot];
       if(!item) return;
-      // refund formula: mps * 5 (same as previous)
       const refund = Math.max(1, Math.floor((item.mps||0) * 5));
       pl.money = (pl.money || 0) + refund;
       pl.collection[slot] = null;
@@ -246,75 +171,60 @@ if (data.type === 'buy' && data.slot !== undefined && data.itemId) {
       return;
     }
 
-    // start steal
+    // START STEAL
     if(data.type === 'stealStart' && data.victimId !== undefined && data.slot !== undefined){
-      const victimId = data.victimId;
+      const victimId = String(data.victimId);
       const slot = Number(data.slot);
       const victim = room.players[victimId];
       if(!victim) return;
       const key = `${victimId}_${slot}`;
-      if(ws.activeSteals[key]) return; // already stealing
-
-      // inform clients steal started
+      if(ws.activeSteals[key]) return;
       broadcastRoom(ws.room, { type:'stealStart', thiefId: ws.id, victimId, slot });
-
-      // schedule steal complete
       const timeout = setTimeout(()=>{
-        // re-check existence
         const victimPlayer = room.players[victimId];
         const thiefPlayer = room.players[ws.id];
         if(victimPlayer && thiefPlayer){
-          const stolenItem = victimPlayer.collection[slot];
-          if(stolenItem){
+          const item = victimPlayer.collection[slot];
+          if(item){
             const freeIndex = thiefPlayer.collection.findIndex(c => !c);
             if(freeIndex !== -1){
-              // transfer
-              thiefPlayer.collection[freeIndex] = stolenItem;
+              thiefPlayer.collection[freeIndex] = item;
               victimPlayer.collection[slot] = null;
-              // notify steal success and broadcast full room
-              broadcastRoom(ws.room, { type:'stealSuccess', thiefId: ws.id, victimId, slot });
             } else {
-              // thief had no space -> steal fails (we will just not transfer)
-              broadcastRoom(ws.room, { type:'stealFail', reason: 'no_space', thiefId: ws.id, victimId, slot });
+              // optional: notify no space
             }
-            broadcastRoom(ws.room);
           }
+          broadcastRoom(ws.room, { type:'stealSuccess', thiefId: ws.id, victimId, slot });
+          broadcastRoom(ws.room);
         }
         delete ws.activeSteals[key];
       }, STEAL_TIMEOUT);
-
       ws.activeSteals[key] = { thiefId: ws.id, timeout };
       return;
     }
 
-    // steal blocked (victim blocks)
+    // BLOCK STEAL
     if(data.type === 'stealBlocked' && data.victimId !== undefined && data.slot !== undefined){
       const key = `${data.victimId}_${data.slot}`;
-      // find which client started that steal: iterate clients in room
+      // find thief client that has this activeSteal
       for(const cid in room.players){
         const client = room.players[cid].ws;
         if(client && client.activeSteals && client.activeSteals[key]){
           const steal = client.activeSteals[key];
           clearTimeout(steal.timeout);
           delete client.activeSteals[key];
-          // notify all
           broadcastRoom(ws.room, { type:'stealBlocked', thiefId: steal.thiefId, victimId: data.victimId, slot: data.slot });
           break;
         }
       }
       return;
     }
-
-    // other message types -> ignore
   });
 
   ws.on('close', ()=>{
-    // remove player from room
     if(ws.room && rooms[ws.room] && rooms[ws.room].players[ws.id]){
       delete rooms[ws.room].players[ws.id];
-      // if room empty, delete and stop timers
       if(Object.keys(rooms[ws.room].players).length === 0){
-        // clear timers if any
         const r = rooms[ws.room];
         if(r.spawnTimer) clearInterval(r.spawnTimer);
         if(r.cleanupTimer) clearInterval(r.cleanupTimer);
@@ -322,15 +232,13 @@ if (data.type === 'buy' && data.slot !== undefined && data.itemId) {
         delete rooms[ws.room];
       } else {
         broadcastRoom(ws.room);
-        maybeStopRoomTimers(ws.room);
       }
     }
   });
 });
 
-/* Graceful shutdown helpers (optional) */
-process.on('SIGINT', ()=> {
-  console.log('Shutting down...');
-  wss.close(()=> process.exit(0));
-});
+process.on('SIGINT', ()=> { console.log('shutting down'); wss.close(()=>process.exit(0)); });
+
+
+
 
