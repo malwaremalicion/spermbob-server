@@ -1,29 +1,40 @@
 // server.js
-// Node WebSocket server — server authoritative buy (Buy Style 2), spawns walkers and broadcasts spawn/remove events.
-// npm install ws
+// Node WebSocket server — server-authoritative buy/sell/steal + walker spawn + mps tick
+// Install: npm install ws
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log('WebSocket server starting on port', PORT);
+console.log('Spermbob server starting on port', PORT);
 
-const ROOMS = {}; // roomCode -> { players: {id: {username, collection, money, ws}}, walkers: Map<id,walker>, walkerInterval }
+/* Config */
+const WALKER_SPAWN_INTERVAL = 1000;   // spawn every 1s
+const WALKER_LIFETIME = 10000;        // 10s lifetime if not bought
+const STEAL_TIMEOUT = 15000;          // 15s to complete steal
+const MPS_TICK_INTERVAL = 1000;       // server awards mps once per second
+const COLLECTION_SLOTS = 8;
 
-const WALKER_SPAWN_INTERVAL = 1000; // 1s
-const WALKER_LIFETIME = 10000; // 10s before auto-removed
-const STEAL_TIMEOUT = 15000; // 15s
+/* Room structure:
+  ROOMS[roomCode] = {
+    players: { wsId: { username, collection: [null..], money, ws } },
+    walkers: Map<walkerId, walkerObject>,
+    walkerInterval: setIntervalRef
+  }
+*/
+const ROOMS = {};
 
 function makeWalker() {
   const rarities = [
-    { id: 'Common', costFactor: 1, tintIndex: 0 },
-    { id: 'Uncommon', costFactor: 2, tintIndex: 1 },
-    { id: 'Rare', costFactor: 4, tintIndex: 2 },
-    { id: 'Epic', costFactor: 8, tintIndex: 3 },
+    { id: 'Common', costFactor: 1 },
+    { id: 'Uncommon', costFactor: 2 },
+    { id: 'Rare', costFactor: 4 },
+    { id: 'Epic', costFactor: 8 }
   ];
   const r = rarities[Math.floor(Math.random() * rarities.length)];
   const type = Math.random() < 0.5 ? 'spermbob' : 'bellbob';
-  const id = 'w' + Date.now().toString(36) + Math.floor(Math.random()*999);
-  const cost = 10 * r.costFactor + Math.floor(Math.random() * (5 * r.costFactor));
+  const id = 'w' + Date.now().toString(36) + Math.floor(Math.random()*900+100);
+  const base = 10 * r.costFactor;
+  const cost = base + Math.floor(Math.random() * (5 * r.costFactor + 1));
   const mps = Math.max(1, Math.floor(cost / 10));
   return { id, type, rarity: r.id, cost, mps };
 }
@@ -31,26 +42,46 @@ function makeWalker() {
 function broadcastRoom(roomCode, extra = null) {
   const room = ROOMS[roomCode];
   if (!room) return;
+  // build players payload (shallow)
   const playersPayload = {};
   for (const id in room.players) {
     const p = room.players[id];
-    playersPayload[id] = {
-      username: p.username,
-      collection: p.collection,
-      money: p.money
-    };
+    playersPayload[id] = { username: p.username, collection: p.collection, money: p.money };
   }
-  // walkers: send array of walkers currently available (for clients that join late)
-  const walkersArr = Array.from(room.walkers.values()).map(w => ({
-    id: w.id, type: w.type, rarity: w.rarity, cost: w.cost, mps: w.mps
-  }));
-  const payload = { type: 'roomUpdate', players: playersPayload, walkers: walkersArr };
-  if (extra) Object.assign(payload, extra);
+  const walkersArr = Array.from(room.walkers.values()).map(w => ({ id: w.id, type: w.type, rarity: w.rarity, cost: w.cost, mps: w.mps }));
+  // send each client with a `you` property for that connection
   for (const id in room.players) {
-    try { room.players[id].ws.send(JSON.stringify(payload)); } catch (e) {}
+    const p = room.players[id];
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+      const payload = { type: 'roomUpdate', players: playersPayload, walkers: walkersArr, you: id };
+      if (extra) Object.assign(payload, extra);
+      try { p.ws.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+    }
   }
 }
 
+/* periodic mps tick on server (authoritative) */
+setInterval(() => {
+  for (const roomCode in ROOMS) {
+    const room = ROOMS[roomCode];
+    let dirty = false;
+    for (const id in room.players) {
+      const p = room.players[id];
+      let inc = 0;
+      for (let i = 0; i < COLLECTION_SLOTS; i++) {
+        const it = p.collection[i];
+        if (it && it.mps) inc += it.mps;
+      }
+      if (inc > 0) {
+        p.money += inc;
+        dirty = true;
+      }
+    }
+    if (dirty) broadcastRoom(roomCode);
+  }
+}, MPS_TICK_INTERVAL);
+
+/* WebSocket server handling */
 wss.on('connection', ws => {
   ws.id = Math.random().toString(36).slice(2,9);
   ws.room = null;
@@ -58,8 +89,8 @@ wss.on('connection', ws => {
 
   ws.on('message', raw => {
     let msg;
-    try { msg = JSON.parse(raw); } catch(e) { return; }
-    // JOIN ROOM
+    try { msg = JSON.parse(raw); } catch (e) { return; }
+    // joinRoom
     if (msg.type === 'joinRoom') {
       const roomCode = msg.roomCode || 'lobby';
       ws.room = roomCode;
@@ -67,50 +98,55 @@ wss.on('connection', ws => {
         ROOMS[roomCode] = { players: {}, walkers: new Map(), walkerInterval: null };
       }
       const room = ROOMS[roomCode];
+      // attach player
       room.players[ws.id] = {
         username: msg.username || ('player' + Math.floor(Math.random()*9999)),
-        collection: Array(8).fill(null),
+        collection: Array(COLLECTION_SLOTS).fill(null),
         money: (typeof msg.money === 'number') ? msg.money : 30,
         ws
       };
-      // spawn loop for this room
+      // start walker spawn for this room if not running
       if (!room.walkerInterval) {
         room.walkerInterval = setInterval(() => {
           const w = makeWalker();
           room.walkers.set(w.id, w);
-          // broadcast single spawn event
-          for (const id in room.players) {
-            try { room.players[id].ws.send(JSON.stringify({ type: 'walkerSpawn', walker: w })); } catch(e) {}
+          // broadcast spawn event to all players in the room
+          for (const pid in room.players) {
+            const p = room.players[pid];
+            if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+              try { p.ws.send(JSON.stringify({ type: 'walkerSpawn', walker: w })); } catch(e) {}
+            }
           }
-          // auto-remove after lifetime (unless bought)
+          // schedule auto remove after lifetime
           setTimeout(() => {
             if (room.walkers.has(w.id)) {
               room.walkers.delete(w.id);
-              for (const id in room.players) {
-                try { room.players[id].ws.send(JSON.stringify({ type: 'walkerRemove', id: w.id })); } catch(e) {}
+              for (const pid in room.players) {
+                const p = room.players[pid];
+                if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+                  try { p.ws.send(JSON.stringify({ type:'walkerRemove', id: w.id })); } catch(e) {}
+                }
               }
             }
           }, WALKER_LIFETIME);
         }, WALKER_SPAWN_INTERVAL);
       }
-      // broadcast updated state (players + current walkers snapshot)
       broadcastRoom(roomCode);
       return;
     }
 
-    // Must be in a room for further messages
+    // client must be in a room for other actions
     if (!ws.room || !ROOMS[ws.room]) return;
     const room = ROOMS[ws.room];
 
-    // BUY REQUEST (server-authoritative)
+    // buyRequest (server authoritative)
     if (msg.type === 'buyRequest' && msg.itemId) {
       const buyer = room.players[ws.id];
       const walker = room.walkers.get(msg.itemId);
       if (!buyer || !walker) {
-        try { ws.send(JSON.stringify({ type: 'buyResult', success:false, reason:'invalid' })); } catch(e) {}
+        try { ws.send(JSON.stringify({ type:'buyResult', success:false, reason:'invalid' })); } catch(e) {}
         return;
       }
-      // check money and free slot
       if (buyer.money < walker.cost) {
         try { ws.send(JSON.stringify({ type:'buyResult', success:false, reason:'no_money' })); } catch(e) {}
         return;
@@ -120,22 +156,24 @@ wss.on('connection', ws => {
         try { ws.send(JSON.stringify({ type:'buyResult', success:false, reason:'no_slot' })); } catch(e) {}
         return;
       }
-      // perform buy: deduct cost, assign item copy into slot, remove walker
+      // perform buy
       buyer.money -= walker.cost;
-      // store shallow copy (so later server-side sell/steal uses same fields)
-      buyer.collection[slot] = { id: walker.id, type: walker.type, rarity: walker.rarity, cost: walker.cost, mps: walker.mps };
+      const itemCopy = { id: walker.id, type: walker.type, rarity: walker.rarity, cost: walker.cost, mps: walker.mps };
+      buyer.collection[slot] = itemCopy;
       room.walkers.delete(walker.id);
-      // notify buyer with success
-      try { ws.send(JSON.stringify({ type:'buyResult', success:true, slot, item: buyer.collection[slot] })); } catch(e) {}
-      // notify all clients to remove walker and update players
-      for (const id in room.players) {
-        try { room.players[id].ws.send(JSON.stringify({ type:'walkerRemove', id: walker.id })); } catch(e) {}
+      try { ws.send(JSON.stringify({ type:'buyResult', success:true, slot, item: itemCopy })); } catch(e){}
+      // broadcast walker removal + full state
+      for (const pid in room.players) {
+        const p = room.players[pid];
+        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(JSON.stringify({ type:'walkerRemove', id: walker.id })); } catch(e) {}
+        }
       }
       broadcastRoom(ws.room);
       return;
     }
 
-    // SELL
+    // sell
     if (msg.type === 'sell' && typeof msg.slot === 'number') {
       const p = room.players[ws.id];
       if (!p) return;
@@ -148,30 +186,36 @@ wss.on('connection', ws => {
       return;
     }
 
-    // STEAL START
+    // stealStart
     if (msg.type === 'stealStart' && msg.victimId && typeof msg.slot === 'number') {
       const victim = room.players[msg.victimId];
       if (!victim) return;
       const key = `${msg.victimId}_${msg.slot}`;
-      if (ws.activeSteals[key]) return; // already stealing same
-      // broadcast start to let clients show progress UI
-      for (const id in room.players) {
-        try { room.players[id].ws.send(JSON.stringify({ type:'stealStart', thiefId: ws.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+      if (ws.activeSteals[key]) return; // already started by same thief
+      // broadcast start
+      for (const pid in room.players) {
+        const p = room.players[pid];
+        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(JSON.stringify({ type:'stealStart', thiefId: ws.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+        }
       }
-      // server-side timeout to complete steal
+      // schedule steal completion
       const timeout = setTimeout(() => {
         const thief = room.players[ws.id];
         const victimNow = room.players[msg.victimId];
-        if (!thief || !victimNow) return;
+        if (!thief || !victimNow) { delete ws.activeSteals[key]; return; }
         const item = victimNow.collection[msg.slot];
         if (!item) { delete ws.activeSteals[key]; return; }
         const free = thief.collection.findIndex(c => !c);
         if (free === -1) { delete ws.activeSteals[key]; return; }
         thief.collection[free] = item;
         victimNow.collection[msg.slot] = null;
-        // notify room of steal success
-        for (const id in room.players) {
-          try { room.players[id].ws.send(JSON.stringify({ type:'stealSuccess', thiefId: ws.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+        // broadcast success then full state
+        for (const pid in room.players) {
+          const p = room.players[pid];
+          if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+            try { p.ws.send(JSON.stringify({ type:'stealSuccess', thiefId: ws.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+          }
         }
         broadcastRoom(ws.room);
         delete ws.activeSteals[key];
@@ -180,33 +224,33 @@ wss.on('connection', ws => {
       return;
     }
 
-    // STEAL BLOCK
+    // stealBlocked (victim blocked)
     if (msg.type === 'stealBlocked' && msg.victimId && typeof msg.slot === 'number') {
-      // find any active steals in server side where the thief is trying to steal victimId_slot
       const key = `${msg.victimId}_${msg.slot}`;
-      // iterate over all clients to find the thief who has that active steal
-      for (const client of wss.clients) {
+      // find any client with that active steal and clear
+      wss.clients.forEach(client => {
         if (client.activeSteals && client.activeSteals[key]) {
           clearTimeout(client.activeSteals[key].timeout);
           delete client.activeSteals[key];
-          // broadcast block
-          for (const id in room.players) {
-            try { room.players[id].ws.send(JSON.stringify({ type:'stealBlocked', thiefId: client.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+          for (const pid in room.players) {
+            const p = room.players[pid];
+            if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+              try { p.ws.send(JSON.stringify({ type:'stealBlocked', thiefId: client.id, victimId: msg.victimId, slot: msg.slot })); } catch(e) {}
+            }
           }
         }
-      }
+      });
       return;
     }
-  }); // end message
+  });
 
   ws.on('close', () => {
     if (!ws.room) return;
     const room = ROOMS[ws.room];
     if (!room) return;
     if (room.players[ws.id]) delete room.players[ws.id];
-    // clean up room if empty
     if (Object.keys(room.players).length === 0) {
-      clearInterval(room.walkerInterval);
+      if (room.walkerInterval) clearInterval(room.walkerInterval);
       delete ROOMS[ws.room];
     } else {
       broadcastRoom(ws.room);
@@ -214,4 +258,6 @@ wss.on('connection', ws => {
   });
 });
 
-console.log('Server ready');
+console.log('Spermbob server ready');
+
+
