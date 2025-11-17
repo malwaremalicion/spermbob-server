@@ -21,14 +21,40 @@ const ROOMS = {}; // roomCode -> { players: {id:{username,collection,money,ws}},
 /* utilities */
 function makeWalker() {
   const rarityTable = [
-  { name: "common", chance: 0.70, tint: "#ffffff", baseCost: 5, baseMps: 1 },
-  { name: "rare", chance: 0.20, tint: "#3b82f6", baseCost: 20, baseMps: 4 },
-  { name: "epic", chance: 0.08, tint: "#a855f7", baseCost: 60, baseMps: 10 },
-  { name: "legendary", chance: 0.01, tint: "#fbbf24", baseCost: 150, baseMps: 25 },
+    { name: "common",       chance: 0.70,  tint: "#ffffff", baseCost: 5,   baseMps: 1 },
+    { name: "rare",         chance: 0.20,  tint: "#3b82f6", baseCost: 20,  baseMps: 4 },
+    { name: "epic",         chance: 0.08,  tint: "#a855f7", baseCost: 60,  baseMps: 10 },
+    { name: "legendary",    chance: 0.01,  tint: "#fbbf24", baseCost: 150, baseMps: 25 },
 
-  // ⭐ NEW SUPER-RARITY
-  { name: "spermbob_god", chance: 0.005, tint: "#ff0000", baseCost: 400, baseMps: 60 }
-];
+    // ⭐ NEW SUPER-RARITY
+    { name: "spermbob_god", chance: 0.005, tint: "#ff0000", baseCost: 400, baseMps: 60 }
+  ];
+
+  // weighted roll
+  const roll = Math.random();
+  let sum = 0;
+  let rarity = rarityTable[0];
+  for (const r of rarityTable) {
+    sum += r.chance;
+    if (roll <= sum) { rarity = r; break; }
+  }
+
+  const id =
+    "w" +
+    Date.now().toString(36) +
+    Math.floor(Math.random() * 900 + 100);
+
+  const type = Math.random() < 0.5 ? "spermbob" : "bellbob";
+
+  return {
+    id,
+    type,
+    rarity: rarity.name,
+    tint: rarity.tint,
+    cost: rarity.baseCost,
+    mps: rarity.baseMps,
+  };
+}
   ];
   const r = rarities[Math.floor(Math.random() * rarities.length)];
   const type = Math.random() < 0.5 ? 'spermbob' : 'bellbob';
@@ -256,5 +282,6 @@ wss.on('connection', ws => {
 });
 
 console.log('Spermbob server ready');
+
 
 
