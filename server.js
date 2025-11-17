@@ -20,11 +20,15 @@ const ROOMS = {}; // roomCode -> { players: {id:{username,collection,money,ws}},
 
 /* utilities */
 function makeWalker() {
-  const rarities = [
-    { id: 'Common', costFactor: 1 },
-    { id: 'Uncommon', costFactor: 2 },
-    { id: 'Rare', costFactor: 4 },
-    { id: 'Epic', costFactor: 8 }
+  const rarityTable = [
+  { name: "common", chance: 0.70, tint: "#ffffff", baseCost: 5, baseMps: 1 },
+  { name: "rare", chance: 0.20, tint: "#3b82f6", baseCost: 20, baseMps: 4 },
+  { name: "epic", chance: 0.08, tint: "#a855f7", baseCost: 60, baseMps: 10 },
+  { name: "legendary", chance: 0.01, tint: "#fbbf24", baseCost: 150, baseMps: 25 },
+
+  // ⭐ NEW SUPER-RARITY
+  { name: "spermbob_god", chance: 0.005, tint: "#ff0000", baseCost: 400, baseMps: 60 }
+];
   ];
   const r = rarities[Math.floor(Math.random() * rarities.length)];
   const type = Math.random() < 0.5 ? 'spermbob' : 'bellbob';
@@ -252,3 +256,5 @@ wss.on('connection', ws => {
 });
 
 console.log('Spermbob server ready');
+
+
