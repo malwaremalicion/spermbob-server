@@ -127,7 +127,48 @@ wss.on('connection', ws => {
       // start walker spawns for room if needed
       if (!room.walkerInterval) {
         room.walkerInterval = setInterval(() => {
-          const w = makeWalker();
+  const w = makeWalker();
+  room.walkers.set(w.id, w);
+
+  // ⭐ ANNOUNCE GOD SPAWN
+  if (w.rarity === "spermbob_god") {
+    for (const pid in room.players) {
+      const p = room.players[pid];
+      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+        p.ws.send(JSON.stringify({
+          type: "announcement",
+          message: "SPERMBOB GOD SPAWNED IN"
+        }));
+      }
+    }
+  }
+
+  // send walkerSpawn to all players
+  for (const pid in room.players) {
+    const p = room.players[pid];
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+      try {
+        p.ws.send(JSON.stringify({ type: "walkerSpawn", walker: w }));
+      } catch (e) {}
+    }
+  }
+
+  // auto-remove timer
+  setTimeout(() => {
+    if (room && room.walkers && room.walkers.has(w.id)) {
+      room.walkers.delete(w.id);
+      for (const pid in room.players) {
+        const p = room.players[pid];
+        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+          try {
+            p.ws.send(JSON.stringify({ type: "walkerRemove", id: w.id }));
+          } catch (e) {}
+        }
+      }
+    }
+  }, WALKER_LIFETIME);
+}, WALKER_SPAWN_INTERVAL);
+
           room.walkers.set(w.id, w);
           // notify clients about this spawn quickly
           for (const pid in room.players) {
@@ -282,6 +323,7 @@ wss.on('connection', ws => {
 });
 
 console.log('Spermbob server ready');
+
 
 
 
